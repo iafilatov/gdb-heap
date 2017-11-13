@@ -361,10 +361,10 @@ class UsageSet(object):
             u = self.usage_by_address[addr]
             # Bail if we already have a more detailed categorization for the
             # address:
-            if level <= u.level:
+            if u.level is not None and level <= u.level:
                 if debug:
                     print ('addr 0x%x already has category %r (level %r)'
-                           % (addr, u.category, u.level))
+                            % (addr, u.category, u.level))
                 return False
             u.category = category
             u.level = level
@@ -403,7 +403,7 @@ class PythonCategorizer(object):
         if c.domain != 'python':
             return False
         if u.obj:
-            if u.obj.categorize_refs(usage_set):
+            if hasattr(u.obj, 'categorize_refs') and u.obj.categorize_refs(usage_set):
                 return True
 
         if c.kind == 'list':
@@ -428,25 +428,25 @@ class PythonCategorizer(object):
                                         Category('python', 'str', 'bytecode'), # FIXME: on py3k this should be bytes
                                         level=1)
             return True
-        elif c.kind == 'sqlite3.Statement':
-            ptr_type = caching_lookup_type('pysqlite_Statement').pointer()
-            obj_ptr = gdb.Value(u.start).cast(ptr_type)
-            #print obj_ptr.dereference()
-            from heap.sqlite import categorize_sqlite3
-            for fieldname, catname, fn in (('db', 'sqlite3', categorize_sqlite3),
-                                           ('st', 'sqlite3_stmt', None)):
-                field_ptr = int(obj_ptr[fieldname])
+        # elif c.kind == 'sqlite3.Statement':
+        #     ptr_type = caching_lookup_type('pysqlite_Statement').pointer()
+        #     obj_ptr = gdb.Value(u.start).cast(ptr_type)
+        #     #print obj_ptr.dereference()
+        #     from heap.sqlite import categorize_sqlite3
+        #     for fieldname, catname, fn in (('db', 'sqlite3', categorize_sqlite3),
+        #                                    ('st', 'sqlite3_stmt', None)):
+        #         field_ptr = int(obj_ptr[fieldname])
 
-                # sqlite's src/mem1.c adds a a sqlite3_int64 (size) to the front
-                # of the allocation, so we need to look 8 bytes earlier to find
-                # the malloc-ed region:
-                malloc_ptr = field_ptr - 8
+        #         # sqlite's src/mem1.c adds a a sqlite3_int64 (size) to the front
+        #         # of the allocation, so we need to look 8 bytes earlier to find
+        #         # the malloc-ed region:
+        #         malloc_ptr = field_ptr - 8
 
-                # print u, fieldname, category, field_ptr
-                if usage_set.set_addr_category(malloc_ptr, Category('sqlite3', catname)):
-                    if fn:
-                        fn(field_ptr, usage_set, set())
-            return True
+        #         # print u, fieldname, category, field_ptr
+        #         if usage_set.set_addr_category(malloc_ptr, Category('sqlite3', catname)):
+        #             if fn:
+        #                 fn(field_ptr, usage_set, set())
+        #     return True
 
         elif c.kind == 'rpm.hdr':
             ptr_type = caching_lookup_type('struct hdrObject_s').pointer()
@@ -469,6 +469,9 @@ class PythonCategorizer(object):
                     pass
                     #blob = h['blob']
                     #usage_set.set_addr_category(int(blob), 'rpm Header blob')
+
+        # else:
+        #     print(c.kind, u)
 
         # Not categorized:
         return False
@@ -525,7 +528,7 @@ def categorize_usage_list(usage_list):
 
         # Cross-references:
         if u.obj:
-            if u.obj.categorize_refs(usage_set):
+            if hasattr(u.obj, 'categorize_refs') and u.obj.categorize_refs(usage_set):
                 continue
 
         # Try to categorize buffers used by python objects:
@@ -548,10 +551,11 @@ def categorize(u, usage_set):
         u.obj = pyop
         try:
             return pyop.categorize()
-        except (RuntimeError, UnicodeEncodeError, UnicodeDecodeError):
+        except (RuntimeError, UnicodeEncodeError, UnicodeDecodeError) as e:
             # If something went wrong, assume that this wasn't really a python
             # object, and fall through:
             print("couldn't categorize pyop:", pyop)
+            print(e)
             pass
 
     # PyPy detection:
@@ -572,11 +576,12 @@ def categorize(u, usage_set):
             return Category('C++', cpp_cls)
 
     # GObject detection:
-    from heap.gobject import as_gtype_instance
-    ginst = as_gtype_instance(addr, size)
-    if ginst:
-        u.obj = ginst
-        return ginst.categorize()
+    # FIXME: disabled because glib for python is ages old
+    # from heap.gobject import as_gtype_instance
+    # ginst = as_gtype_instance(addr, size)
+    # if ginst:
+    #     u.obj = ginst
+    #     return ginst.categorize()
 
     s = as_nul_terminated_string(addr, size)
     if s and len(s) > 2:
@@ -661,7 +666,8 @@ def iter_usage():
     except WrongInferiorProcess:
         pass
 
-    for i, chunk in enumerate(ms.iter_mmap_chunks()):
+    # for i, chunk in enumerate(ms.iter_mmap_chunks()):
+    for i, chunk in enumerate(ms.iter_chunks(in_use=True)):
         mem_ptr = chunk.as_mem()
         chunksize = chunk.chunksize()
 
@@ -672,17 +678,23 @@ def iter_usage():
         else:
             yield Usage(int(mem_ptr), chunksize)
 
-    for chunk in ms.iter_sbrk_chunks():
-        mem_ptr = chunk.as_mem()
-        chunksize = chunk.chunksize()
+    # Iter usages of CPython arenas
+    from heap.cpython import PyArenaPtr
+    for arena in CPythonArenaDetection().arenaobjs:
+        for u in PyArenaPtr(arena.address, arena).iter_usage():
+            yield u
 
-        if chunk.is_inuse():
-            arena = cached_state.detect_arena(mem_ptr, chunksize)
-            if arena:
-                for u in arena.iter_usage():
-                    yield u
-            else:
-                yield Usage(int(mem_ptr), chunksize)
+    # for chunk in ms.iter_sbrk_chunks():
+    #     mem_ptr = chunk.as_mem()
+    #     chunksize = chunk.chunksize()
+
+    #     if chunk.is_inuse():
+    #         arena = cached_state.detect_arena(mem_ptr, chunksize)
+    #         if arena:
+    #             for u in arena.iter_usage():
+    #                 yield u
+    #         else:
+    #             yield Usage(int(mem_ptr), chunksize)
 
 
 
@@ -694,8 +706,8 @@ def looks_like_ptr(value):
     '''
 
     # NULL is acceptable; assume that it's 0 on every arch we care about
-    if value == 0:
-        return True
+    # if value == 0:
+    #     return True
 
     # Assume that pointers aren't allocated in the bottom 1MB of a process'
     # address space:

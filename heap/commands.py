@@ -133,21 +133,37 @@ class HeapUsed(gdb.Command):
 
     @need_debuginfo
     def invoke(self, args, from_tty):
+        args = args.split()
+        if args:
+            only_size = int(args[0])
+            only_cat = args[1]
+            only_str = args[2]
+        else:
+            only_size = None
+            only_cat = None
+            only_str = None
         print('Used chunks of memory on heap')
         print('-----------------------------')
         ms = glibc_arenas.get_ms()
-        for i, chunk in enumerate(ms.iter_chunks()):
-            if not chunk.is_inuse():
+        for i, u in enumerate(lazily_get_usage_list()):
+            # if not chunk.is_inuse():
+            #     continue
+            # size = chunk.chunksize()
+            # mem = chunk.as_mem()
+            # u = Usage(mem, size)
+            size = u.size
+            if only_size and size != only_size:
                 continue
-            size = chunk.chunksize()
-            mem = chunk.as_mem()
-            u = Usage(mem, size)
             category = categorize(u, None)
-            hd = hexdump_as_bytes(mem, 32)
+            if only_cat and category.kind != only_cat:
+                continue
+            hd = hexdump_as_bytes(u.start, min(size, 64))
+            if only_str and  only_str not in hd:
+                continue
             print ('%6i: %s -> %s %8i bytes %20s |%s'
                    % (i,
-                      fmt_addr(chunk.as_mem()),
-                      fmt_addr(chunk.as_mem()+size-1),
+                      fmt_addr(u.start),
+                      fmt_addr(u.start + size),
                       size, category, hd))
         print()
 

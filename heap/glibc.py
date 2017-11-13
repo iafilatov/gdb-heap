@@ -74,6 +74,13 @@ class MChunkPtr(WrappedPointer):
     def chunksize(self):
         return self.size() & ~(self.SIZE_BITS)
 
+    def musable(self):
+        if self.has_IS_MMAPPED:
+            return self.chunksize() - 2 * SIZE_SZ;
+        elif self.is_inuse():
+            return self.hunksize() - SIZE_SZ;
+        return 0
+
     def has_flag(self, flag):
         return self.size() & flag
 
@@ -130,7 +137,6 @@ class MChunkPtr(WrappedPointer):
         cs = self.chunksize()
         ptr += cs
         ptr = ptr.cast(MChunkPtr.gdb_type())
-        #print 'next_chunk returning: 0x%x' % ptr
         return MChunkPtr(ptr)
 
     def prev_chunk(self):
@@ -182,7 +188,7 @@ class MallocState(WrappedValue):
         #print '005', ptr
         return MBinPtr(ptr)
 
-    def iter_chunks(self):
+    def iter_chunks(self, in_use=False):
         '''Yield a sequence of MChunkPtr corresponding to all chunks of memory
         in the heap (both used and free), in order of ascending address'''
 
@@ -190,27 +196,35 @@ class MallocState(WrappedValue):
             yield c
 
         for c in self.iter_sbrk_chunks():
+            if in_use and not c.is_inuse():
+                continue
             yield c
 
     def iter_mmap_chunks(self):
-        for inf in gdb.inferiors():
-            for (start, end) in iter_mmap_heap_chunks(inf.pid):
-                # print "Trying 0x%x-0x%x" % (start, end)
-                try:
-                    chunk = MChunkPtr(gdb.Value(start).cast(MChunkPtr.gdb_type()))
-                    # Does this look like the first chunk within a range of
-                    # mmap address space?
-                    #print ('0x%x' % chunk.as_address() + chunk.chunksize())
-                    if (not chunk.has_NON_MAIN_ARENA() and chunk.has_IS_MMAPPED()
-                        and chunk.as_address() + chunk.chunksize() <= end):
+        for start, end in iter_mem_chunks():
+            # gdb.write("Trying 0x%x-0x%x\n" % (start, end))
+            try:
+                chunk = MChunkPtr(gdb.Value(start).cast(MChunkPtr.gdb_type()))
+                # Does this look like the first chunk within a range of
+                # mmap address space?
 
-                        # Iterate upwards until you reach "end" of mmap space:
-                        while chunk.as_address() < end and chunk.has_IS_MMAPPED():
-                            yield chunk
-                            # print '0x%x' % chunk.as_address(), chunk
-                            chunk = chunk.next_chunk()
-                except RuntimeError:
-                    pass
+                # gdb.write('MMAP ' + str(chunk) + '\n')
+
+                if (
+                    # not chunk.has_NON_MAIN_ARENA() and
+                    chunk.has_IS_MMAPPED()
+                    and chunk.as_address() + chunk.chunksize() <= end):
+
+                    # gdb.write('MMAP ' + str(chunk) + '\n')
+
+                    # Iterate upwards until you reach "end" of mmap space:
+                    while chunk.as_address() < end and chunk.has_IS_MMAPPED():
+                        # gdb.write('YIELD ' + str(chunk) + '\n')
+                        yield chunk
+                        chunk = chunk.next_chunk()
+            except RuntimeError as e:
+                gdb.write('{:x} -> {:x}: {}\n'.format(start, end, e))
+                pass
 
     def iter_sbrk_chunks(self):
         '''Yield a sequence of MChunkPtr corresponding to all chunks of memory
@@ -241,7 +255,6 @@ class MallocState(WrappedValue):
             top = int(self.field('top'))
             while chunk.as_address() != top:
                 yield chunk
-                # print '0x%x' % chunk.as_address(), chunk
                 try:
                     chunk = chunk.next_chunk()
                 except RuntimeError:
@@ -378,37 +391,47 @@ def sbrk_base():
 #
 
 
-def iter_mmap_heap_chunks(pid):
-    '''Try to locate the memory-mapped heap allocations for the given
-    process (by PID) by reading /proc/PID/maps
+def iter_mem_chunks():
+    try:
+        gdb.execute('info proc status', False, True)
+        return ((start, end)
+                for inf in gdb.inferiors()
+                for start, end in iter_proc_maps(inf.pid))
+    except gdb.error:
+        return iter_core_sections()
 
-    Yield a sequence of (start, end) pairs'''
-    for line in open('/proc/%i/maps' % pid):
-        # print line,
-        # e.g.:
-        # 38e441e000-38e441f000 rw-p 0001e000 fd:01 1087                           /lib64/ld-2.11.1.so
-        # 38e441f000-38e4420000 rw-p 00000000 00:00 0
-        hexd = r'[0-9a-f]'
-        hexdigits = '(' + hexd + '+)'
-        m = re.match(hexdigits + '-' + hexdigits
-                     + r' ([r\-][w\-][x\-][ps]) ' + hexdigits
-                     + r' (..:..) (\d+)\s+(.*)',
-                     line)
-        if m:
-            # print m.groups()
-            start, end, perms, offset, dev, inode, pathname = m.groups()
-            # PROT_READ, PROT_WRITE, MAP_PRIVATE:
-            if perms == 'rw-p':
-                if offset == '00000000': # FIXME bits?
-                    if dev == '00:00': # FIXME
-                        if inode == '0': # FIXME
-                            if pathname == '': # FIXME
-                                # print 'heap line?:', line
-                                # print m.groups()
-                                start, end = [int(m.group(i), 16) for i in (1, 2)]
-                                yield (start, end)
-        else:
-            print('unmatched :', line)
+
+def iter_core_sections(only_load=True):
+    '''Read memory allocations from core file.'''
+    sections = gdb.execute('info files', False, True)
+    pat = re.compile(r'\s+(?P<start>0x[0-9a-f]+) - (?P<end>0x[0-9a-f]+)'
+                     r' is (?P<sect>[\w\d\.]+)(?: in (?P<path>.+))?')
+    for line in sections.splitlines():
+        m = pat.match(line)
+        if not m:
+            continue
+        sect = m.group('sect')
+        if only_load and not sect.startswith('load'):
+            continue
+        start, end = int(m.group('start'), 16), int(m.group('end'), 16)
+        yield start, end
+
+
+def iter_proc_maps(pid):
+    '''Read memory allocations of a debugged process.'''
+    sections = gdb.execute('info proc mappings {}'.format(pid), False, True)
+    pat = re.compile(r'\s+(?P<start>0x[0-9a-f]+)\s+(?P<end>0x[0-9a-f]+)'
+                     r'\s+(?P<size>0x[0-9a-f]+)\s+(?P<offset>0x[0-9a-f]+)'
+                     r'\s*(?P<objfile>.*)')
+    for line in sections.splitlines():
+        m = pat.match(line)
+        if not m:
+            continue
+        if m.group('objfile') not in ('', '[heap]'):
+            continue
+        start, end = int(m.group('start'), 16), int(m.group('end'), 16)
+        yield start, end
+
 
 class GlibcArenas(object):
     def __init__(self):

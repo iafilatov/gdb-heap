@@ -1,11 +1,30 @@
 '''
 This file is licensed under the PSF license
 '''
+import re
 import sys
+
 import gdb
 from heap import WrappedPointer, caching_lookup_type, Usage, \
     type_void_ptr, fmt_addr, Category, looks_like_ptr, \
     WrongInferiorProcess, Table
+
+import libpython
+
+from libpython import (
+    Py_TPFLAGS_HEAPTYPE,
+    Py_TPFLAGS_LONG_SUBCLASS,
+    Py_TPFLAGS_LIST_SUBCLASS,
+    Py_TPFLAGS_TUPLE_SUBCLASS,
+    Py_TPFLAGS_BYTES_SUBCLASS,
+    Py_TPFLAGS_UNICODE_SUBCLASS,
+    Py_TPFLAGS_DICT_SUBCLASS,
+    Py_TPFLAGS_BASE_EXC_SUBCLASS,
+    Py_TPFLAGS_TYPE_SUBCLASS,
+    _PyObject_VAR_SIZE,
+    int_from_int,
+    PyTypeObjectPtr,
+)
 
 
 SIZEOF_VOID_P = type_void_ptr.sizeof
@@ -48,7 +67,7 @@ class PyArenaPtr(WrappedPointer):
         # obmalloc.c sets up arenaobj->pool_address to the first pool
         # address, aligning it to POOL_SIZE_MASK:
         self.initial_pool_addr = self.as_address()
-        self.num_pools = ARENA_SIZE / POOL_SIZE
+        self.num_pools = ARENA_SIZE // POOL_SIZE
         self.excess = self.initial_pool_addr & POOL_SIZE_MASK
         if self.excess != 0:
             self.num_pools -= 1
@@ -185,10 +204,8 @@ class PyPoolPtr(WrappedPointer):
         free_block_addresses = self._free_blocks()
 
         size = self.block_size()
-        initnextoffset = self._firstoffset()
+        offset = self._firstoffset()
         nextoffset = self.field('nextoffset')
-        #print initnextoffset, nextoffset
-        offset = initnextoffset
         base_addr = self.as_address()
         # Iterate upwards until you reach "pool->nextoffset": blocks beyond
         # that point have never been allocated:
@@ -200,53 +217,45 @@ class PyPoolPtr(WrappedPointer):
             offset += size
 
 
-Py_TPFLAGS_HEAPTYPE = (1 << 9)
+class PyObjectPtr(libpython.PyObjectPtr, WrappedPointer):
 
-Py_TPFLAGS_INT_SUBCLASS      = (1 << 23)
-Py_TPFLAGS_LONG_SUBCLASS     = (1 << 24)
-Py_TPFLAGS_LIST_SUBCLASS     = (1 << 25)
-Py_TPFLAGS_TUPLE_SUBCLASS    = (1 << 26)
-Py_TPFLAGS_STRING_SUBCLASS   = (1 << 27)
-Py_TPFLAGS_UNICODE_SUBCLASS  = (1 << 28)
-Py_TPFLAGS_DICT_SUBCLASS     = (1 << 29)
-Py_TPFLAGS_BASE_EXC_SUBCLASS = (1 << 30)
-Py_TPFLAGS_TYPE_SUBCLASS     = (1 << 31)
-
-class PyObjectPtr(WrappedPointer):
     @classmethod
-    def from_pyobject_ptr(cls, addr):
-        ob_type = addr['ob_type']
-        tp_flags = ob_type['tp_flags']
-        if tp_flags & Py_TPFLAGS_HEAPTYPE:
-            return HeapTypeObjectPtr(addr)
+    def subclass_from_type(cls, t):
+        # OMG what am I doing? Don't look.
+        klass = super().subclass_from_type(t)
 
-        if tp_flags & Py_TPFLAGS_UNICODE_SUBCLASS:
-            return PyUnicodeObjectPtr(addr.cast(caching_lookup_type('PyUnicodeObject').pointer()))
+        def categorize(self):
+            # Python objects will be categorized as ("python", tp_name), but
+            # old-style classes have to do more work
+            # l = [str(self)]
+            # try:
+            #     l.append(str(self.type()))
+            #     l.append(self.type().field('tp_name').string())
+            # except Exception as e:
+            #     print('categorize')
+            #     print('\n'.join(l))
+            #     print(e)
+            return Category('python', self.safe_tp_name())
 
-        if tp_flags & Py_TPFLAGS_DICT_SUBCLASS:
-            return PyDictObjectPtr(addr.cast(caching_lookup_type('PyDictObject').pointer()))
+        klass.categorize = categorize
 
-        tp_name = ob_type['tp_name'].string()
-        if tp_name == 'instance':
-            __type_PyInstanceObjectPtr = caching_lookup_type('PyInstanceObject').pointer()
-            return PyInstanceObjectPtr(addr.cast(__type_PyInstanceObjectPtr))
-
-        return PyObjectPtr(addr)
-
-    def type(self):
-        return PyTypeObjectPtr(self.field('ob_type'))
-
-    def safe_tp_name(self):
-        try:
-            return self.type().field('tp_name').string()
-        except(RuntimeError, UnicodeDecodeError):
-            # Can't even read the object at all?
-            return 'unknown'
-
-    def categorize(self):
-        # Python objects will be categorized as ("python", tp_name), but
-        # old-style classes have to do more work
-        return Category('python', self.safe_tp_name())
+        if klass is libpython.HeapTypeObjectPtr:
+            return HeapTypeObjectPtr
+        elif klass is libpython.PyDictObjectPtr:
+            return PyDictObjectPtr
+        # elif klass is libpython.PyUnicodeObjectPtr:
+        #     return PyUnicodeObjectPtr
+        # elif klass is libpython.PyLongObjectPtr:
+        #     return PyLongObjectPtr
+        # elif klass is libpython.PyListObjectPtr:
+        #     return PyListObjectPtr
+        # elif klass is libpython.PyTypeObjectPtr:
+        #     return PyTypeObjectPtr
+        # elif klass is libpython.PyBytesObjectPtr:
+        #     return PyBytesObjectPtr
+        # elif klass is libpython.PyBaseExceptionObjectPtr:
+        #     return PyBaseExceptionObjectPtr
+        return klass
 
     def as_malloc_addr(self):
         ob_type = addr['ob_type']
@@ -257,46 +266,40 @@ class PyObjectPtr(WrappedPointer):
         else:
             return addr
 
-# Taken from my libpython.py code in python's Tools/gdb/libpython.py
-# FIXME: ideally should share code somehow
-def _PyObject_VAR_SIZE(typeobj, nitems):
-    type_size_t = caching_lookup_type('size_t')
-    return ( ( typeobj.field('tp_basicsize') +
-               nitems * typeobj.field('tp_itemsize') +
-               (SIZEOF_VOID_P - 1)
-             ) & ~(SIZEOF_VOID_P - 1)
-           ).cast(type_size_t)
-def int_from_int(gdbval):
-    return int(gdbval)
+class PyUnicodeObjectPtr(libpython.PyUnicodeObjectPtr, PyObjectPtr):
+    pass
 
-class PyUnicodeObjectPtr(PyObjectPtr):
-    """
-    Class wrapping a gdb.Value that's a PyUnicodeObject* within the process
-    being debugged.
-    """
-    _typename = 'PyUnicodeObject'
+class PyLongObjectPtr(libpython.PyLongObjectPtr, PyObjectPtr):
+    pass
 
-    def categorize_refs(self, usage_set, level=0, detail=None):
-        m_str = int(self.field('str'))
-        usage_set.set_addr_category(m_str,
-                                    Category('cpython', 'PyUnicodeObject buffer', detail),
-                                    level)
-        return True
+class PyListObjectPtr(libpython.PyListObjectPtr, PyObjectPtr):
+    pass
 
-class PyDictObjectPtr(PyObjectPtr):
+class PyTupleObjectPtr(libpython.PyTupleObjectPtr, PyObjectPtr):
+    pass
+
+class PyBytesObjectPtr(libpython.PyBytesObjectPtr, PyObjectPtr):
+    pass
+
+class PyBaseExceptionObjectPtr(libpython.PyBaseExceptionObjectPtr, PyObjectPtr):
+    pass
+
+class PyDictObjectPtr(libpython.PyDictObjectPtr, PyObjectPtr):
     """
     Class wrapping a gdb.Value that's a PyDictObject* i.e. a dict instance
     within the process being debugged.
     """
     _typename = 'PyDictObject'
 
+    # FIXME: ma_keys isn't in usages so it's ingored anyway
     def categorize_refs(self, usage_set, level=0, detail=None):
-        ma_table = int(self.field('ma_table'))
-        usage_set.set_addr_category(ma_table,
-                                    Category('cpython', 'PyDictEntry table', detail),
+        ma_keys = int(self.field('ma_keys'))
+        usage_set.set_addr_category(ma_keys,
+                                    Category('cpython', 'PyDictKeysObject', detail),
                                     level)
         return True
 
+# FIXME: This is never used since we're using from_pyobject_ptr from libpython
 class PyInstanceObjectPtr(PyObjectPtr):
     _typename = 'PyInstanceObject'
 
@@ -311,6 +314,7 @@ class PyInstanceObjectPtr(PyObjectPtr):
         return Category('python', self.cl_name(), 'old-style')
 
     def categorize_refs(self, usage_set, level=0, detail=None):
+        return True # FIXME
         cl_name = self.cl_name()
         # print 'cl_name', cl_name
 
@@ -337,13 +341,11 @@ class PyInstanceObjectPtr(PyObjectPtr):
                                     level=2)
         return True
 
-class PyTypeObjectPtr(PyObjectPtr):
-    _typename = 'PyTypeObject'
-
-class HeapTypeObjectPtr(PyObjectPtr):
+class HeapTypeObjectPtr(libpython.HeapTypeObjectPtr, PyObjectPtr):
     _typename = 'PyObject'
 
     def categorize_refs(self, usage_set, level=0, detail=None):
+        return True  # FIXME
         attr_dict = self.get_attr_dict()
         if attr_dict:
             # Mark the dictionary's "detail" with our typename
@@ -357,39 +359,6 @@ class HeapTypeObjectPtr(PyObjectPtr):
                                       detail='%s.__dict__' % self.safe_tp_name())
         return True
 
-    def get_attr_dict(self):
-        '''
-        Get the PyDictObject ptr representing the attribute dictionary
-        (or None if there's a problem)
-        '''
-        from heap import type_char_ptr
-        try:
-            typeobj = self.type()
-            dictoffset = int_from_int(typeobj.field('tp_dictoffset'))
-            if dictoffset != 0:
-                if dictoffset < 0:
-                    type_PyVarObject_ptr = caching_lookup_type('PyVarObject').pointer()
-                    tsize = int_from_int(self._gdbval.cast(type_PyVarObject_ptr)['ob_size'])
-                    if tsize < 0:
-                        tsize = -tsize
-                    size = _PyObject_VAR_SIZE(typeobj, tsize)
-                    dictoffset += size
-                    assert dictoffset > 0
-                    if dictoffset % SIZEOF_VOID_P != 0:
-                        # Corrupt somehow?
-                        return None
-
-                dictptr = self._gdbval.cast(type_char_ptr) + dictoffset
-                PyObjectPtrPtr = caching_lookup_type('PyObject').pointer().pointer()
-                dictptr = dictptr.cast(PyObjectPtrPtr)
-                return PyObjectPtr.from_pyobject_ptr(dictptr.dereference())
-        except RuntimeError:
-            # Corrupt data somewhere; fail safe
-            pass
-
-        # Not found, or some kind of error:
-        return None
-
 def is_pyobject_ptr(addr):
     try:
         _type_pyop = caching_lookup_type('PyObject').pointer()
@@ -398,27 +367,57 @@ def is_pyobject_ptr(addr):
         # not linked against python
         return None
 
-    pyop = gdb.Value(addr).cast(_type_pyop)
     try:
+        typeop = pyop = gdb.Value(addr).cast(_type_pyop)
+
+        # If we follow type chain on a PyObject long enough, we should arrive
+        # at 'type' and type(type) should be 'type'.
+        # The levels are:     a <- b means a = type(b)
+        # 0 - type
+        # 1 - type <- class A
+        #     type <- class M(type)
+        # 2 - type <- class A <- A()
+        #     type <- class M(type) <- class B(metaclass=M)
+        # 3 - type <- class M(type) <- class B(metaclass=M) <- B()
+        for i in range(4):
+            if typeop['ob_type'] == typeop:
+                return PyObjectPtr.from_pyobject_ptr(pyop)
+            typeop = typeop['ob_type'].cast(_type_pyop)
+
+        return 0
+
+        # gdb.write('PYOP {}\n'.format(pyop))
         ob_refcnt = pyop['ob_refcnt']
         if ob_refcnt >=0 and ob_refcnt < 0xffff:
+            # gdb.write('refcnt ok {}\n'.format(int(ob_refcnt)))
             obtype = pyop['ob_type']
-            if obtype != 0:
+            if looks_like_ptr(obtype):
+                # gdb.write('obtype ok {}\n'.format(obtype))
                 type_refcnt = obtype.cast(_type_pyop)['ob_refcnt']
                 if type_refcnt > 0 and type_refcnt < 0xffff:
-                    type_ob_size = obtype.cast(_type_pyvarop)['ob_size']
+                    # gdb.write('type refcnt ok\n')
+                    # type_ob_size = obtype.cast(_type_pyvarop)['ob_size']
 
-                    if type_ob_size > 0xffff:
-                        return 0
+                    # if type_ob_size > 0xffff:
+                    #     return 0
 
-                    for fieldname in ('tp_del', 'tp_mro', 'tp_init', 'tp_getset'):
+                    # gdb.write('ob size ok\n')
+
+                    for fieldname in ('tp_base', 'tp_free', 'tp_repr', 'tp_new'):
                         if not looks_like_ptr(obtype[fieldname]):
                             return 0
+
+                    # gdb.write('methods ok\n')
 
                     # Then this looks like a Python object:
                     return PyObjectPtr.from_pyobject_ptr(pyop)
 
-    except (RuntimeError, UnicodeDecodeError):
+    except  UnicodeDecodeError as e:
+        # print('is_pyobject_ptr 0x{:x}'.format(addr))
+        # gdb.write(str(e) + '\n')
+        pass
+
+    except RuntimeError:
         pass # Not a python object (or corrupt)
 
     # Doesn't look like a python object, implicit return None
@@ -455,9 +454,9 @@ def as_python_object(addr):
         gc_ptr = gdb.Value(addr).cast(_type_PyGC_Head_ptr)
         # print gc_ptr.dereference()
 
-        PYGC_REFS_REACHABLE = -3
+        # PYGC_REFS_REACHABLE = -3
 
-        if gc_ptr['gc']['gc_refs'] == PYGC_REFS_REACHABLE:  # FIXME: need to cover other values
+        if gc_ptr['gc']['gc_refs'] in (-2, -3, -4):  # FIXME: need to cover other values
             pyop = is_pyobject_ptr(gdb.Value(addr + _type_PyGC_Head.sizeof))
             if pyop:
                 return pyop
@@ -472,15 +471,16 @@ class ArenaObject(WrappedPointer):
     '''
     @classmethod
     def iter_arenas(cls):
+        arenas_var, maxarenas_var = cls._get_arena_vars()
         try:
-            val_arenas = gdb.parse_and_eval('arenas')
-            val_maxarenas = gdb.parse_and_eval('maxarenas')
+            val_arenas = gdb.parse_and_eval("'{}'".format(arenas_var))
+            val_maxarenas = gdb.parse_and_eval("'{}'".format(maxarenas_var))
         except RuntimeError:
             # Not linked against python, or no debug information:
             raise WrongInferiorProcess('cpython')
 
         try:
-            for i in range(val_maxarenas):
+            for i in range(int(val_maxarenas)):
                 # Look up "&arenas[i]":
                 obj = ArenaObject(val_arenas[i].address)
 
@@ -491,6 +491,27 @@ class ArenaObject(WrappedPointer):
             # pypy also has a symbol named "arenas", of type "long unsigned int * volatile"
             # For now, ignore it:
             return
+
+    @classmethod
+    def _get_arena_vars(cls):
+        '''
+        Get names of 'arenas' and 'maxarenas' vars which can be chaged by
+        link time optimization.
+        '''
+        # TODO: Is there a better way to do this?
+        vars = gdb.execute('info variables arenas', False, True)
+        arenas_pat = re.compile(r'struct arena_object \*(arenas(?:\.lto_priv\.\d+))')
+        maxarenas_pat = re.compile(r'unsigned int (maxarenas(?:\.lto_priv\.\d+))')
+        arenas = maxarenas = None
+        for line in vars.splitlines():
+            arenas_m = arenas_pat.match(line)
+            if arenas_m:
+                arenas = arenas_m.group(1)
+            maxarenas_m = maxarenas_pat.match(line)
+            if maxarenas_m:
+                maxarenas = maxarenas_m.group(1)
+            if arenas and maxarenas:
+                return arenas, maxarenas
 
     @property  # need to override the base property
     def address(self):
@@ -514,12 +535,14 @@ class ArenaDetection(object):
         '''Detect if this ptr returned by malloc is in use as a Python arena,
         returning PyArenaPtr if it is, None if not'''
         # Fast rejection of too-small chunks:
+        # https://www.python.org/dev/peps/pep-0445/
         if chunksize < (256 * 1024):
             return None
 
         for arenaobj in self.arenaobjs:
             if ptr == arenaobj.address:
                 # Found it:
+                print('ARENA {:x} -> {:x}'.format(ptr, ptr + chunksize) )
                 return PyArenaPtr.from_addr(ptr, arenaobj)
 
         # Not found:
